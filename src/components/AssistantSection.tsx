@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
   Info,
@@ -17,6 +17,12 @@ const SUGGESTED_QUESTIONS: string[] = [
   "Dame 3 expresiones sencillas en inglés para tranquilizar a un paciente antes de una inyección.",
 ];
 
+type SseEventPayload =
+  | { type: "meta"; tier?: string; model?: string }
+  | { type: "delta"; text?: string }
+  | { type: "done"; model?: string; tier?: string }
+  | { type: "error"; code?: string; message?: string };
+
 export default function AssistantSection() {
   const [statusLoading, setStatusLoading] = useState(true);
   const [isConfigured, setIsConfigured] = useState<boolean>(false);
@@ -24,7 +30,10 @@ export default function AssistantSection() {
   const [input, setInput] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [sending, setSending] = useState(false);
+  const [streamingMsgId, setStreamingMsgId] = useState<string | null>(null);
   const [requestError, setRequestError] = useState("");
+  const abortRef = useRef<AbortController | null>(null);
+  const chatBottomRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -66,8 +75,24 @@ export default function AssistantSection() {
     checkStatus();
     return () => {
       active = false;
+      abortRef.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    if (messages.length > 0) {
+      chatBottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
+  }, [messages, sending]);
+
+  const handleClear = () => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setSending(false);
+    setStreamingMsgId(null);
+    setMessages([]);
+    setRequestError("");
+  };
 
   const handleSend = async (promptText?: string) => {
     const query = (promptText ?? input).trim();
@@ -85,6 +110,15 @@ export default function AssistantSection() {
       return;
     }
 
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    const historySnapshot = messages
+      .filter((m) => m.content.trim().length > 0)
+      .slice(-4)
+      .map((m) => ({ role: m.role, content: m.content }));
+
     const userMsg: ChatMessage = {
       id: `u-${Date.now()}`,
       role: "user",
@@ -95,58 +129,137 @@ export default function AssistantSection() {
       }),
     };
 
-    const nextHistory = [...messages, userMsg];
-    setMessages(nextHistory);
+    const aiMsgId = `a-${Date.now() + 1}`;
+    const aiTimestamp = new Date().toLocaleTimeString("es-MX", {
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+
+    setMessages((prev) => [...prev, userMsg]);
     if (!promptText) {
       setInput("");
     }
     setSending(true);
+    setStreamingMsgId(null);
+
+    let assistantInserted = false;
+    const appendAssistantDelta = (delta: string) => {
+      if (!delta) return;
+      if (!assistantInserted) {
+        assistantInserted = true;
+        setStreamingMsgId(aiMsgId);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: aiMsgId,
+            role: "assistant",
+            content: delta,
+            timestamp: aiTimestamp,
+          },
+        ]);
+      } else {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === aiMsgId ? { ...m, content: m.content + delta } : m
+          )
+        );
+      }
+    };
 
     try {
       const response = await fetch("/api/assistant", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+        },
         body: JSON.stringify({
           question: query,
-          history: messages.map((m) => ({ role: m.role, content: m.content })),
+          history: historySnapshot,
+          stream: true,
         }),
+        signal: controller.signal,
       });
 
-      const rawText = await response.text();
-      let data: { reply?: string; message?: string } = {};
-      try {
-        data = JSON.parse(rawText) as { reply?: string; message?: string };
-      } catch {
-        throw new Error(
-          `El servidor respondió HTTP ${response.status} sin JSON válido.`
-        );
+      const contentType = response.headers.get("content-type") ?? "";
+
+      if (contentType.includes("text/event-stream") && response.body) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() ?? "";
+
+          for (const frame of frames) {
+            const dataLines = frame
+              .split("\n")
+              .filter((line) => line.startsWith("data:"))
+              .map((line) => line.slice(5).trim());
+
+            for (const rawJson of dataLines) {
+              if (!rawJson) continue;
+              let event: SseEventPayload;
+              try {
+                event = JSON.parse(rawJson) as SseEventPayload;
+              } catch {
+                continue;
+              }
+
+              if (event.type === "delta" && event.text) {
+                appendAssistantDelta(event.text);
+              } else if (event.type === "error") {
+                throw new Error(
+                  event.message ||
+                    "Ocurrió un error al recibir la respuesta del asistente."
+                );
+              }
+            }
+          }
+        }
+
+        if (!assistantInserted) {
+          throw new Error("El servicio de IA no devolvió una respuesta válida.");
+        }
+      } else {
+        const rawText = await response.text();
+        let data: { reply?: string; message?: string } = {};
+        try {
+          data = JSON.parse(rawText) as { reply?: string; message?: string };
+        } catch {
+          throw new Error(
+            `El servidor respondió HTTP ${response.status} sin JSON válido.`
+          );
+        }
+
+        if (!response.ok || !data.reply) {
+          throw new Error(
+            data.message || "El servicio de IA no devolvió una respuesta válida."
+          );
+        }
+
+        appendAssistantDelta(data.reply);
       }
-
-      if (!response.ok || !data.reply) {
-        throw new Error(
-          data.message || "El servicio de IA no devolvió una respuesta válida."
-        );
-      }
-
-      const aiMsg: ChatMessage = {
-        id: `a-${Date.now()}`,
-        role: "assistant",
-        content: data.reply,
-        timestamp: new Date().toLocaleTimeString("es-MX", {
-          hour: "2-digit",
-          minute: "2-digit",
-        }),
-      };
-
-      setMessages((prev) => [...prev, aiMsg]);
     } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return;
+      }
       setRequestError(
         err instanceof Error
           ? err.message
           : "Error de conexión al consultar al asistente."
       );
     } finally {
+      if (abortRef.current === controller) {
+        abortRef.current = null;
+      }
       setSending(false);
+      setStreamingMsgId(null);
     }
   };
 
@@ -168,10 +281,7 @@ export default function AssistantSection() {
         {messages.length > 0 && (
           <button
             type="button"
-            onClick={() => {
-              setMessages([]);
-              setRequestError("");
-            }}
+            onClick={handleClear}
             className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap shrink-0"
           >
             <Trash2 className="w-3.5 h-3.5" />
@@ -231,7 +341,7 @@ export default function AssistantSection() {
                 Mientras tanto, puedes utilizar
               </h3>
               <p className="text-sm text-slate-600 leading-relaxed">
-                El <strong>Traductor Médico</strong> (conectado a MyMemory API), el catálogo de{" "}
+                El <strong>Traductor Médico</strong> (conectado a DeepL / MyMemory API), el catálogo de{" "}
                 <strong>Vocabulario Técnico</strong> con 9 categorías y el módulo de{" "}
                 <strong>Pronunciación</strong> con audio del navegador funcionan al 100%.
               </p>
@@ -285,6 +395,7 @@ export default function AssistantSection() {
               ) : (
                 messages.map((msg) => {
                   const isUser = msg.role === "user";
+                  const isCurrentlyStreaming = streamingMsgId === msg.id;
                   return (
                     <div
                       key={msg.id}
@@ -300,21 +411,33 @@ export default function AssistantSection() {
                         }`}
                       >
                         {msg.content}
+                        {isCurrentlyStreaming && (
+                          <span
+                            aria-hidden="true"
+                            className="inline-block w-1.5 h-4 ml-1 align-middle bg-sky-600 animate-pulse rounded-xs"
+                          />
+                        )}
                       </div>
                       <span className="text-[11px] text-slate-400 mt-1 px-1 font-mono tabular-nums">
-                        {isUser ? "Estudiante" : "Asistente educativo"} · {msg.timestamp}
+                        {isUser
+                          ? "Estudiante"
+                          : isCurrentlyStreaming
+                          ? "Escribiendo respuesta..."
+                          : "Asistente educativo"}{" "}
+                        · {msg.timestamp}
                       </span>
                     </div>
                   );
                 })
               )}
 
-              {sending && (
+              {sending && !streamingMsgId && (
                 <div className="flex items-center gap-2 text-sm text-sky-700 bg-white border border-slate-200 rounded-xl px-4 py-3 w-fit">
                   <Loader2 className="w-4 h-4 animate-spin" />
                   <span>Preparando explicación educativa...</span>
                 </div>
               )}
+              <div ref={chatBottomRef} />
             </div>
 
             {requestError && (
