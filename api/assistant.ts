@@ -1,4 +1,5 @@
 import {
+  classifyGeminiError,
   generateNursingReply,
   getGeminiClient,
   readJsonBody,
@@ -59,7 +60,11 @@ export default async function handler(req: VercelReq, res: VercelRes) {
     .slice(-6);
 
   try {
-    const reply = await generateNursingReply(ai, question, safeHistory);
+    const { reply, modelUsed } = await generateNursingReply(
+      ai,
+      question,
+      safeHistory
+    );
     if (!reply) {
       sendJson(res, 502, {
         error: "EMPTY_MODEL_RESPONSE",
@@ -69,37 +74,34 @@ export default async function handler(req: VercelReq, res: VercelRes) {
       return;
     }
 
-    sendJson(res, 200, { reply });
+    sendJson(res, 200, { reply, model: modelUsed });
   } catch (error) {
     console.error("Vercel Gemini API error:", error);
-    const errObj = error as { status?: number; message?: string };
-    const errStatus = errObj?.status;
-    const errMessage = errObj?.message ?? "Error desconocido";
+    const info = classifyGeminiError(error);
 
-    if (
-      errStatus === 403 ||
-      errMessage.includes("403") ||
-      errMessage.includes("PERMISSION_DENIED") ||
-      errMessage.includes("API_KEY_INVALID") ||
-      errMessage.includes("API key not valid")
-    ) {
-      sendJson(res, 502, {
+    if (info.isAuthError) {
+      sendJson(res, 401, {
         error: "AI_AUTH_ERROR",
         message:
-          "La clave GEMINI_API_KEY configurada en Vercel no es válida o tiene restricciones de acceso.",
+          "La clave GEMINI_API_KEY configurada no es válida o no tiene permisos de acceso.",
       });
       return;
     }
 
-    if (
-      errStatus === 429 ||
-      errMessage.includes("429") ||
-      errMessage.includes("RESOURCE_EXHAUSTED")
-    ) {
+    if (info.isRateLimit) {
       sendJson(res, 429, {
         error: "AI_RATE_LIMIT",
         message:
           "Se alcanzó temporalmente el límite de consultas del servicio de IA. Espera unos segundos e inténtalo de nuevo.",
+      });
+      return;
+    }
+
+    if (info.isModelNotFound) {
+      sendJson(res, 502, {
+        error: "AI_MODEL_NOT_FOUND",
+        message:
+          "Ningún modelo de Gemini compatible estuvo disponible para tu clave API (error 404). Revisa la configuración de GEMINI_MODEL o los permisos del proyecto en Google AI Studio.",
       });
       return;
     }

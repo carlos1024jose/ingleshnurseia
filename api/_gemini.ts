@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import process from "node:process";
 import type { IncomingMessage } from "node:http";
-import { GoogleGenAI } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 
 export interface VercelReq extends Partial<IncomingMessage> {
   method?: string;
@@ -38,6 +38,9 @@ Reglas de estilo y seguridad:
 
 export const ALLOWED_TTS_VOICES = new Set(["Kore", "Zephyr", "Puck", "Charon"]);
 
+const DEFAULT_TEXT_MODELS = ["gemini-4-hydrogen", "gemini-3.1-flash-lite"];
+let cachedDiscoveredModel: string | null = null;
+
 export function sendJson(
   res: VercelRes,
   statusCode: number,
@@ -70,7 +73,12 @@ export function getGeminiClient(): GoogleGenAI | null {
     return null;
   }
   return new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
+    apiKey: process.env.GEMINI_API_KEY?.trim(),
+    httpOptions: {
+      headers: {
+        "User-Agent": "aistudio-build",
+      },
+    },
   });
 }
 
@@ -116,22 +124,105 @@ export async function readJsonBody<T = Record<string, unknown>>(
   return {} as T;
 }
 
-function isModelNotFoundError(error: unknown): boolean {
-  const err = error as { status?: number; message?: string };
-  const msg = (err?.message ?? "").toLowerCase();
-  return (
-    err?.status === 404 ||
-    msg.includes("not found") ||
-    msg.includes("is not supported") ||
-    msg.includes("unknown model")
-  );
+export function classifyGeminiError(error: unknown): {
+  status?: number;
+  message: string;
+  isAuthError: boolean;
+  isRateLimit: boolean;
+  isModelNotFound: boolean;
+} {
+  const err = error as { status?: number; code?: number; message?: string };
+  const status = err?.status ?? err?.code;
+  const message = err?.message ?? "Error desconocido";
+  const lower = message.toLowerCase();
+
+  const isAuthError =
+    status === 401 ||
+    status === 403 ||
+    lower.includes("401") ||
+    lower.includes("403") ||
+    lower.includes("permission_denied") ||
+    lower.includes("api_key_invalid") ||
+    lower.includes("api key not valid") ||
+    lower.includes("unauthenticated") ||
+    lower.includes("unauthorized");
+
+  const isRateLimit =
+    status === 429 ||
+    lower.includes("429") ||
+    lower.includes("resource_exhausted") ||
+    lower.includes("quota");
+
+  const isModelNotFound =
+    !isAuthError &&
+    !isRateLimit &&
+    (status === 404 ||
+      lower.includes("not_found") ||
+      lower.includes("is not found") ||
+      lower.includes("not supported for generatecontent") ||
+      lower.includes("unknown model"));
+
+  return { status, message, isAuthError, isRateLimit, isModelNotFound };
+}
+
+async function discoverActiveTextModels(ai: GoogleGenAI): Promise<string[]> {
+  try {
+    const pager = await ai.models.list();
+    const discovered: string[] = [];
+
+    for await (const m of pager) {
+      const rawName = m.name ?? "";
+      const id = rawName.replace(/^models\//, "").trim();
+      if (!id) continue;
+
+      const lower = id.toLowerCase();
+      if (
+        !lower.includes("gemini") ||
+        lower.includes("tts") ||
+        lower.includes("image") ||
+        lower.includes("embedding") ||
+        lower.includes("live") ||
+        lower.includes("transcribe") ||
+        lower.includes("omni") ||
+        lower.includes("decision") ||
+        lower.includes("robotics") ||
+        lower.includes("computer-use")
+      ) {
+        continue;
+      }
+
+      const actions =
+        (m as { supportedActions?: string[] }).supportedActions ?? [];
+      if (actions.length > 0 && !actions.includes("generateContent")) {
+        continue;
+      }
+
+      discovered.push(id);
+    }
+
+    // Prefer flash / hydrogen / lite models first for fast educational Q&A
+    discovered.sort((a, b) => {
+      const score = (name: string) => {
+        const n = name.toLowerCase();
+        if (n.includes("hydrogen")) return 0;
+        if (n.includes("flash-lite")) return 1;
+        if (n.includes("flash")) return 2;
+        return 3;
+      };
+      return score(a) - score(b);
+    });
+
+    return discovered.slice(0, 3);
+  } catch {
+    return [];
+  }
 }
 
 export async function generateNursingReply(
   ai: GoogleGenAI,
   question: string,
   safeHistory: AssistantHistoryItem[]
-): Promise<string> {
+): Promise<{ reply: string; modelUsed: string }> {
   const contents = [
     ...safeHistory.map((msg) => ({
       role: msg.role === "assistant" ? "model" : "user",
@@ -144,30 +235,63 @@ export async function generateNursingReply(
   ];
 
   const configuredModel = process.env.GEMINI_MODEL?.trim();
-  const candidates = configuredModel
-    ? [configuredModel]
-    : ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"];
+  const initialCandidates = Array.from(
+    new Set(
+      [configuredModel, cachedDiscoveredModel, ...DEFAULT_TEXT_MODELS].filter(
+        (m): m is string => Boolean(m)
+      )
+    )
+  );
 
-  let lastError: unknown;
-  for (const model of candidates) {
-    try {
-      const response = await ai.models.generateContent({
-        model,
-        contents,
-        config: {
-          systemInstruction: SYSTEM_INSTRUCTION,
-        },
-      });
-      return response.text?.trim() ?? "";
-    } catch (error) {
-      lastError = error;
-      if (!isModelNotFoundError(error)) {
-        throw error;
+  const tryModels = async (models: string[]) => {
+    let lastError: unknown;
+    for (const model of models) {
+      try {
+        const supportsThinkingLevel =
+          model === "gemini-4-hydrogen" || model.startsWith("gemini-3.");
+        const response = await ai.models.generateContent({
+          model,
+          contents,
+          config: supportsThinkingLevel
+            ? {
+                systemInstruction: SYSTEM_INSTRUCTION,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              }
+            : {
+                systemInstruction: SYSTEM_INSTRUCTION,
+              },
+        });
+        cachedDiscoveredModel = model;
+        return { reply: response.text?.trim() ?? "", modelUsed: model };
+      } catch (error) {
+        lastError = error;
+        const info = classifyGeminiError(error);
+        // Never retry auth (401/403), rate limit (429), or non-404 errors
+        if (!info.isModelNotFound) {
+          throw error;
+        }
       }
     }
-  }
+    throw lastError ?? new Error("No available Gemini model succeeded.");
+  };
 
-  throw lastError ?? new Error("No available Gemini model succeeded.");
+  try {
+    return await tryModels(initialCandidates);
+  } catch (error) {
+    const info = classifyGeminiError(error);
+    if (!info.isModelNotFound) {
+      throw error;
+    }
+
+    const discovered = (await discoverActiveTextModels(ai)).filter(
+      (m) => !initialCandidates.includes(m)
+    );
+    if (discovered.length === 0) {
+      throw error;
+    }
+
+    return await tryModels(discovered);
+  }
 }
 
 export function ensurePlayableWav(

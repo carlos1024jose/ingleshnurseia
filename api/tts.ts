@@ -1,6 +1,7 @@
 import process from "node:process";
 import {
   ALLOWED_TTS_VOICES,
+  classifyGeminiError,
   ensurePlayableWav,
   getGeminiClient,
   readJsonBody,
@@ -49,53 +50,93 @@ export default async function handler(req: VercelReq, res: VercelRes) {
       : "Kore";
   const slow = Boolean(body?.slow);
 
-  try {
-    const ttsModel =
-      process.env.GEMINI_TTS_MODEL?.trim() || "gemini-2.5-flash-preview-tts";
-    const promptPrefix = slow
-      ? "Say clearly and very slowly for a nursing student"
-      : "Say clearly at a steady pace for a nursing student";
+  const configuredTtsModel = process.env.GEMINI_TTS_MODEL?.trim();
+  const ttsCandidates = Array.from(
+    new Set(
+      [
+        configuredTtsModel,
+        "gemini-3.8-flash-lite-tts",
+        "gemini-3.8-flash-tts",
+      ].filter((m): m is string => Boolean(m))
+    )
+  );
 
-    const response = await ai.models.generateContent({
-      model: ttsModel,
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: `${promptPrefix}: ${rawText}` }],
-        },
-      ],
-      config: {
-        responseModalities: ["AUDIO"],
-        speechConfig: {
-          voiceConfig: {
-            prebuiltVoiceConfig: { voiceName },
+  const stylePrompt = slow
+    ? "Clear, warm, very slow and articulate English pronunciation instructor for nursing students. Pronounce every syllable distinctly."
+    : "Clear, calm, articulate English nursing instructor speaking at a steady, easy-to-understand pace.";
+
+  let lastError: unknown;
+  for (const model of ttsCandidates) {
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents: [
+          {
+            role: "user",
+            parts: [
+              {
+                text: rawText,
+                speechMetadata: { style: stylePrompt },
+              },
+            ],
+          },
+        ],
+        config: {
+          responseModalities: ["AUDIO"],
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: { voiceName },
+            },
           },
         },
-      },
-    });
+      });
 
-    const inlineData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
-    const base64Audio = inlineData?.data;
+      const inlineData =
+        response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+      const base64Audio = inlineData?.data;
 
-    if (!base64Audio) {
-      sendJson(res, 502, {
-        error: "EMPTY_AUDIO",
-        message: "No se pudo generar el audio.",
+      if (!base64Audio) {
+        sendJson(res, 502, {
+          error: "EMPTY_AUDIO",
+          message: "No se pudo generar el audio.",
+        });
+        return;
+      }
+
+      const playable = ensurePlayableWav(base64Audio, inlineData?.mimeType);
+      sendJson(res, 200, {
+        audioBase64: playable.audioBase64,
+        mimeType: playable.mimeType,
+        voiceName,
       });
       return;
+    } catch (error) {
+      lastError = error;
+      const info = classifyGeminiError(error);
+      if (!info.isModelNotFound) {
+        break;
+      }
     }
-
-    const playable = ensurePlayableWav(base64Audio, inlineData?.mimeType);
-    sendJson(res, 200, {
-      audioBase64: playable.audioBase64,
-      mimeType: playable.mimeType,
-      voiceName,
-    });
-  } catch (error) {
-    console.error("Vercel TTS error:", error);
-    sendJson(res, 502, {
-      error: "TTS_UPSTREAM_ERROR",
-      message: "No se pudo obtener el audio HD en este momento.",
-    });
   }
+
+  console.error("Vercel TTS error:", lastError);
+  const info = classifyGeminiError(lastError);
+  if (info.isAuthError) {
+    sendJson(res, 401, {
+      error: "TTS_AUTH_ERROR",
+      message: "La clave de Gemini no es válida o no está autorizada para TTS.",
+    });
+    return;
+  }
+  if (info.isRateLimit) {
+    sendJson(res, 429, {
+      error: "TTS_RATE_LIMIT",
+      message: "Límite temporal alcanzado en el servicio de voz HD.",
+    });
+    return;
+  }
+  sendJson(res, 502, {
+    error: "TTS_UPSTREAM_ERROR",
+    message: "No se pudo obtener el audio HD en este momento.",
+  });
 }

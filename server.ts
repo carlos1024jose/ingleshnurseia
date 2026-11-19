@@ -3,56 +3,21 @@ import express from "express";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 import { createServer as createViteServer } from "vite";
+import {
+  ALLOWED_TTS_VOICES,
+  classifyGeminiError,
+  ensurePlayableWav,
+  generateNursingReply,
+  getGeminiClient,
+  isGeminiConfigured,
+  type AssistantHistoryItem,
+} from "./api/_gemini.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
-
-function isGeminiConfigured(): boolean {
-  const key = process.env.GEMINI_API_KEY?.trim();
-  return Boolean(
-    key &&
-      key !== "MY_GEMINI_API_KEY" &&
-      key !== "YOUR_API_KEY" &&
-      key.length > 10
-  );
-}
-
-function getGeminiClient(): GoogleGenAI | null {
-  if (!isGeminiConfigured()) {
-    return null;
-  }
-  return new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
-    httpOptions: {
-      headers: {
-        "User-Agent": "aistudio-build",
-      },
-    },
-  });
-}
-
-const SYSTEM_INSTRUCTION = `Eres el asistente educativo de English Nurse AI, una plataforma digital dirigida a estudiantes de Enfermería que aprenden inglés técnico del área de la salud.
-
-Tu rol es estrictamente educativo:
-1. Explicar el significado de términos médicos y de Enfermería en inglés con traducción precisa al español.
-2. Aclarar diferencias entre palabras similares o que suelen confundirse (por ejemplo: pain vs ache, symptom vs sign, dosage vs prescription, IV vs IM).
-3. Proporcionar ejemplos sencillos y realistas de uso en entorno clínico (incluyendo oración en inglés y traducción al español).
-4. Explicar expresiones y abreviaturas comunes utilizadas por personal de enfermería y en la comunicación con pacientes.
-
-Reglas de estilo y seguridad:
-- Responde en español claro, estructurado y fácil de leer para estudiantes de Enfermería.
-- Incluye los términos técnicos y ejemplos clave en inglés resaltados con claridad.
-- Mantén un tono pedagógico, directo y profesional.
-- NO des diagnósticos médicos, prescripciones ni recomendaciones clínicas personalizadas. Recuerda brevemente cuando corresponda que tus explicaciones tienen un propósito educativo y no sustituyen la orientación de profesionales de la salud o docentes clínicos.`;
-
-interface AssistantHistoryItem {
-  role: "user" | "assistant";
-  content: string;
-}
 
 async function startServer() {
   const app = express();
@@ -211,64 +176,13 @@ async function startServer() {
       )
       .slice(-6);
 
-    const contents = [
-      ...safeHistory.map((msg) => ({
-        role: msg.role === "assistant" ? "model" : "user",
-        parts: [{ text: msg.content }],
-      })),
-      {
-        role: "user",
-        parts: [{ text: question }],
-      },
-    ];
-
     try {
-      const configuredModel = process.env.GEMINI_MODEL?.trim();
-      let response;
-      if (configuredModel) {
-        response = await ai.models.generateContent({
-          model: configuredModel,
-          contents,
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-          },
-        });
-      } else {
-        try {
-          response = await ai.models.generateContent({
-            model: "gemini-4-hydrogen",
-            contents,
-            config: {
-              systemInstruction: SYSTEM_INSTRUCTION,
-              thinkingConfig: {
-                thinkingLevel: ThinkingLevel.LOW,
-              },
-            },
-          });
-        } catch (primaryErr) {
-          const pErr = primaryErr as { status?: number; message?: string };
-          const pMsg = (pErr?.message ?? "").toLowerCase();
-          if (
-            pErr?.status === 404 ||
-            pErr?.status === 400 ||
-            pMsg.includes("not found") ||
-            pMsg.includes("is not supported") ||
-            pMsg.includes("model")
-          ) {
-            response = await ai.models.generateContent({
-              model: "gemini-2.5-flash",
-              contents,
-              config: {
-                systemInstruction: SYSTEM_INSTRUCTION,
-              },
-            });
-          } else {
-            throw primaryErr;
-          }
-        }
-      }
+      const { reply, modelUsed } = await generateNursingReply(
+        ai,
+        question,
+        safeHistory
+      );
 
-      const reply = response.text?.trim();
       if (!reply) {
         res.status(502).json({
           error: "EMPTY_MODEL_RESPONSE",
@@ -278,21 +192,13 @@ async function startServer() {
         return;
       }
 
-      res.json({ reply });
+      res.json({ reply, model: modelUsed });
     } catch (error) {
       console.error("Error calling Gemini API:", error);
-      const errObj = error as { status?: number; message?: string };
-      const errStatus = errObj?.status;
-      const errMessage = errObj?.message ?? "Error desconocido";
+      const info = classifyGeminiError(error);
 
-      if (
-        errStatus === 403 ||
-        errMessage.includes("403") ||
-        errMessage.includes("PERMISSION_DENIED") ||
-        errMessage.includes("API_KEY_INVALID") ||
-        errMessage.includes("API key not valid")
-      ) {
-        res.status(502).json({
+      if (info.isAuthError) {
+        res.status(401).json({
           error: "AI_AUTH_ERROR",
           message:
             "La API de inteligencia artificial no está autorizada o la clave configurada no es válida en este entorno. No se muestran respuestas simuladas.",
@@ -300,15 +206,20 @@ async function startServer() {
         return;
       }
 
-      if (
-        errStatus === 429 ||
-        errMessage.includes("429") ||
-        errMessage.includes("RESOURCE_EXHAUSTED")
-      ) {
+      if (info.isRateLimit) {
         res.status(429).json({
           error: "AI_RATE_LIMIT",
           message:
             "Se alcanzó temporalmente el límite de consultas del servicio de IA. Espera unos segundos e inténtalo de nuevo.",
+        });
+        return;
+      }
+
+      if (info.isModelNotFound) {
+        res.status(502).json({
+          error: "AI_MODEL_NOT_FOUND",
+          message:
+            "Ningún modelo de Gemini compatible estuvo disponible para tu clave API (error 404). Revisa GEMINI_MODEL o los permisos del proyecto.",
         });
         return;
       }
@@ -321,8 +232,7 @@ async function startServer() {
     }
   });
 
-  const ttsCache = new Map<string, string>();
-  const ALLOWED_TTS_VOICES = new Set(["Kore", "Zephyr", "Puck", "Charon"]);
+  const ttsCache = new Map<string, { audioBase64: string; mimeType: string }>();
 
   app.post("/api/tts", async (req, res) => {
     const ai = getGeminiClient();
@@ -362,28 +272,41 @@ async function startServer() {
 
     const cached = ttsCache.get(cacheKey);
     if (cached) {
-      res.json({ audioBase64: cached, mimeType: "audio/wav", voiceName });
+      res.json({
+        audioBase64: cached.audioBase64,
+        mimeType: cached.mimeType,
+        voiceName,
+      });
       return;
     }
 
-    try {
-      const stylePrompt = slow
-        ? "Clear, warm, very slow and articulate English pronunciation instructor for nursing students. Pronounce every syllable distinctly."
-        : "Clear, calm, articulate English nursing instructor speaking at a steady, easy-to-understand pace.";
+    const configuredTtsModel = process.env.GEMINI_TTS_MODEL?.trim();
+    const ttsCandidates = Array.from(
+      new Set(
+        [
+          configuredTtsModel,
+          "gemini-3.8-flash-lite-tts",
+          "gemini-3.8-flash-tts",
+        ].filter((m): m is string => Boolean(m))
+      )
+    );
 
-      let response;
+    const stylePrompt = slow
+      ? "Clear, warm, very slow and articulate English pronunciation instructor for nursing students. Pronounce every syllable distinctly."
+      : "Clear, calm, articulate English nursing instructor speaking at a steady, easy-to-understand pace.";
+
+    let lastError: unknown;
+    for (const model of ttsCandidates) {
       try {
-        response = await ai.models.generateContent({
-          model: "gemini-3.8-flash-lite-tts",
+        const response = await ai.models.generateContent({
+          model,
           contents: [
             {
               role: "user",
               parts: [
                 {
                   text: rawText,
-                  speechMetadata: {
-                    style: stylePrompt,
-                  },
+                  speechMetadata: { style: stylePrompt },
                 },
               ],
             },
@@ -397,67 +320,61 @@ async function startServer() {
             },
           },
         });
-      } catch (primaryTtsErr) {
-        const pErr = primaryTtsErr as { status?: number; message?: string };
-        const pMsg = (pErr?.message ?? "").toLowerCase();
-        if (
-          pErr?.status === 404 ||
-          pErr?.status === 400 ||
-          pMsg.includes("not found") ||
-          pMsg.includes("model")
-        ) {
-          const prefix = slow
-            ? "Say clearly and very slowly for a nursing student"
-            : "Say clearly at a steady pace for a nursing student";
-          response = await ai.models.generateContent({
-            model:
-              process.env.GEMINI_TTS_MODEL?.trim() ||
-              "gemini-2.5-flash-preview-tts",
-            contents: [
-              {
-                role: "user",
-                parts: [{ text: `${prefix}: ${rawText}` }],
-              },
-            ],
-            config: {
-              responseModalities: ["AUDIO"],
-              speechConfig: {
-                voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName },
-                },
-              },
-            },
+
+        const inlineData =
+          response.candidates?.[0]?.content?.parts?.[0]?.inlineData;
+        const base64Audio = inlineData?.data;
+
+        if (!base64Audio) {
+          res.status(502).json({
+            error: "EMPTY_AUDIO",
+            message: "No se pudo generar el audio.",
           });
-        } else {
-          throw primaryTtsErr;
+          return;
         }
-      }
 
-      const base64Audio =
-        response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        const playable = ensurePlayableWav(base64Audio, inlineData?.mimeType);
+        if (ttsCache.size >= 120) {
+          const oldestKey = ttsCache.keys().next().value;
+          if (oldestKey) ttsCache.delete(oldestKey);
+        }
+        ttsCache.set(cacheKey, playable);
 
-      if (!base64Audio) {
-        res.status(502).json({
-          error: "EMPTY_AUDIO",
-          message: "No se pudo generar el audio.",
+        res.json({
+          audioBase64: playable.audioBase64,
+          mimeType: playable.mimeType,
+          voiceName,
         });
         return;
+      } catch (error) {
+        lastError = error;
+        const info = classifyGeminiError(error);
+        if (!info.isModelNotFound) {
+          break;
+        }
       }
-
-      if (ttsCache.size >= 120) {
-        const oldestKey = ttsCache.keys().next().value;
-        if (oldestKey) ttsCache.delete(oldestKey);
-      }
-      ttsCache.set(cacheKey, base64Audio);
-
-      res.json({ audioBase64: base64Audio, mimeType: "audio/wav", voiceName });
-    } catch (error) {
-      console.error("TTS upstream error:", error);
-      res.status(502).json({
-        error: "TTS_UPSTREAM_ERROR",
-        message: "No se pudo obtener el audio HD en este momento.",
-      });
     }
+
+    console.error("TTS upstream error:", lastError);
+    const info = classifyGeminiError(lastError);
+    if (info.isAuthError) {
+      res.status(401).json({
+        error: "TTS_AUTH_ERROR",
+        message: "La clave de Gemini no es válida o no está autorizada para TTS.",
+      });
+      return;
+    }
+    if (info.isRateLimit) {
+      res.status(429).json({
+        error: "TTS_RATE_LIMIT",
+        message: "Límite temporal alcanzado en el servicio de voz HD.",
+      });
+      return;
+    }
+    res.status(502).json({
+      error: "TTS_UPSTREAM_ERROR",
+      message: "No se pudo obtener el audio HD en este momento.",
+    });
   });
 
   const isProd = process.env.NODE_ENV === "production";
