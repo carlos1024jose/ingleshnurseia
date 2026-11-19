@@ -3,18 +3,6 @@
   "installCommand": "npm install",
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
-  "regions": ["iad1"],
-  "functions": {
-    "api/assistant.ts": {
-      "maxDuration": 60
-    },
-    "api/translate.ts": {
-      "maxDuration": 30
-    },
-    "api/tts.ts": {
-      "maxDuration": 30
-    }
-  },
   "rewrites": [
     {
       "source": "/((?!api/).*)",

@@ -1,7 +1,6 @@
 import { Buffer } from "node:buffer";
 import process from "node:process";
 import type { IncomingMessage } from "node:http";
-import { performance } from "node:perf_hooks";
 import { GoogleGenAI, ThinkingLevel } from "@google/genai";
 
 export interface VercelReq extends Partial<IncomingMessage> {
@@ -12,14 +11,10 @@ export interface VercelReq extends Partial<IncomingMessage> {
 
 export interface VercelRes {
   statusCode?: number;
-  writableEnded?: boolean;
   status?: (code: number) => VercelRes;
   json?: (data: unknown) => void;
-  setHeader?: (name: string, value: string) => unknown;
-  flushHeaders?: () => void;
-  write?: (chunk: string) => boolean;
+  setHeader?: (name: string, value: string) => void;
   end?: (chunk?: string) => void;
-  on?: (event: string, listener: () => void) => unknown;
 }
 
 export interface AssistantHistoryItem {
@@ -27,53 +22,24 @@ export interface AssistantHistoryItem {
   content: string;
 }
 
-export type QueryComplexity = "simple" | "complex";
+export const SYSTEM_INSTRUCTION = `Eres el asistente educativo de English Nurse AI, una plataforma digital dirigida a estudiantes de Enfermería que aprenden inglés técnico del área de la salud.
 
-export interface GenerationMetrics {
-  tier: QueryComplexity;
-  modelUsed: string;
-  backendPrepMs: number;
-  promptPrepMs: number;
-  sdkDispatchMs: number;
-  ttftMs: number;
-  genDurationMs: number;
-  totalMs: number;
-  promptTokens?: number;
-  outputTokens?: number;
-  totalTokens?: number;
-  inputChars: number;
-  outputChars: number;
-  historyTurnsUsed: number;
-}
+Tu rol es estrictamente educativo:
+1. Explicar el significado de términos médicos y de Enfermería en inglés con traducción precisa al español.
+2. Aclarar diferencias entre palabras similares o que suelen confundirse (por ejemplo: pain vs ache, symptom vs sign, dosage vs prescription, IV vs IM).
+3. Proporcionar ejemplos sencillos y realistas de uso en entorno clínico (incluyendo oración en inglés y traducción al español).
+4. Explicar expresiones y abreviaturas comunes utilizadas por personal de enfermería y en la comunicación con pacientes.
 
-// Concise, medically accurate prompts tuned by query tier to minimize input tokens & latency
-const SYSTEM_INSTRUCTION_SIMPLE = `Eres el asistente educativo de English Nurse AI para estudiantes de Enfermería.
-Responde en español claro y directo, resaltando términos y ejemplos clave en inglés.
-Para definiciones, vocabulario o siglas: da traducción precisa, uso clínico breve y 1 ejemplo corto inglés-español (máx. ~120 palabras).
-Solo propósito educativo: no des diagnósticos ni prescripciones médicas.`;
-
-const SYSTEM_INSTRUCTION_COMPLEX = `Eres el asistente educativo de English Nurse AI para estudiantes de Enfermería.
-Responde en español claro y estructurado, destacando términos y frases clave en inglés.
-Explica con precisión diferencias entre términos, procedimientos o comunicación clínica, con ejemplos prácticos inglés-español (máx. ~280 palabras salvo que se pida mayor detalle).
-Solo propósito educativo: no emitas diagnósticos ni indicaciones clínicas personalizadas y recuerda brevemente que es apoyo académico.`;
+Reglas de estilo y seguridad:
+- Responde en español claro, estructurado y fácil de leer para estudiantes de Enfermería.
+- Incluye los términos técnicos y ejemplos clave en inglés resaltados con claridad.
+- Mantén un tono pedagógico, directo y profesional.
+- NO des diagnósticos médicos, prescripciones ni recomendaciones clínicas personalizadas. Recuerda brevemente cuando corresponda que tus explicaciones tienen un propósito educativo y no sustituyen la orientación de profesionales de la salud o docentes clínicos.`;
 
 export const ALLOWED_TTS_VOICES = new Set(["Kore", "Zephyr", "Puck", "Charon"]);
 
-const SIMPLE_TIER_MODELS = [
-  "gemini-3.5-flash-lite",
-  "gemini-3.1-flash-lite",
-  "gemini-4-hydrogen",
-];
-
-const COMPLEX_TIER_MODELS = [
-  "gemini-3.8-flash",
-  "gemini-4-hydrogen",
-  "gemini-3.1-flash-lite",
-];
-
-let cachedClient: GoogleGenAI | null = null;
-let cachedApiKey: string | null = null;
-const cachedModelByTier: Partial<Record<QueryComplexity, string>> = {};
+const DEFAULT_TEXT_MODELS = ["gemini-4-hydrogen", "gemini-3.1-flash-lite"];
+let cachedDiscoveredModel: string | null = null;
 
 export function sendJson(
   res: VercelRes,
@@ -106,20 +72,14 @@ export function getGeminiClient(): GoogleGenAI | null {
   if (!isGeminiConfigured()) {
     return null;
   }
-  const key = process.env.GEMINI_API_KEY!.trim();
-  if (cachedClient && cachedApiKey === key) {
-    return cachedClient;
-  }
-  cachedApiKey = key;
-  cachedClient = new GoogleGenAI({
-    apiKey: key,
+  return new GoogleGenAI({
+    apiKey: process.env.GEMINI_API_KEY?.trim(),
     httpOptions: {
       headers: {
         "User-Agent": "aistudio-build",
       },
     },
   });
-  return cachedClient;
 }
 
 export async function readJsonBody<T = Record<string, unknown>>(
@@ -162,87 +122,6 @@ export async function readJsonBody<T = Record<string, unknown>>(
   }
 
   return {} as T;
-}
-
-/**
- * Zero-latency deterministic heuristic classifier (no extra LLM call).
- */
-export function classifyNursingQuery(question: string): QueryComplexity {
-  const normalized = question.trim().toLowerCase();
-  const wordCount = normalized.split(/\s+/).filter(Boolean).length;
-
-  const complexPatterns =
-    /\b(diferencia|diferencias|compara|comparar|versus|vs\.?|procedimiento|protocolo|paso a paso|pasos|explica|explicame|explícame|profundidad|detallad|cuando usar|cuándo usar|ejemplos|diálogo|dialogo|conversación|conversacion|valoración|valoracion|administración|administracion|cuidados|caso clínico|caso clinico|diagnóstico|diagnostico|dame \d+)\b/i;
-
-  if (normalized.length >= 130 || wordCount >= 22 || complexPatterns.test(normalized)) {
-    return "complex";
-  }
-  return "simple";
-}
-
-function buildOptimizedPromptPayload(
-  question: string,
-  safeHistory: AssistantHistoryItem[],
-  tier: QueryComplexity
-) {
-  const referencesPriorContext =
-    /\b(eso|esa|ese|esos|esas|anterior|antes|más ejemplos|mas ejemplos|otra vez|también|tambien|y qué|y que)\b/i.test(
-      question
-    );
-
-  const maxTurns = tier === "simple" ? (referencesPriorContext ? 2 : 0) : 4;
-  const trimmedHistory = maxTurns > 0 ? safeHistory.slice(-maxTurns) : [];
-
-  const contents = [
-    ...trimmedHistory.map((msg) => ({
-      role: msg.role === "assistant" ? "model" : "user",
-      parts: [
-        {
-          text:
-            msg.role === "assistant" && msg.content.length > 500
-              ? `${msg.content.slice(0, 500)}...`
-              : msg.content,
-        },
-      ],
-    })),
-    {
-      role: "user",
-      parts: [{ text: question }],
-    },
-  ];
-
-  const systemInstruction =
-    tier === "simple" ? SYSTEM_INSTRUCTION_SIMPLE : SYSTEM_INSTRUCTION_COMPLEX;
-
-  return {
-    contents,
-    systemInstruction,
-    historyTurnsUsed: trimmedHistory.length,
-  };
-}
-
-function getModelConfig(
-  model: string,
-  tier: QueryComplexity,
-  systemInstruction: string
-) {
-  const lower = model.toLowerCase();
-  if (lower.includes("flash-lite")) {
-    return {
-      systemInstruction,
-      thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
-    };
-  }
-  if (lower === "gemini-4-hydrogen" || lower.startsWith("gemini-3.")) {
-    return {
-      systemInstruction,
-      thinkingConfig: {
-        thinkingLevel:
-          tier === "simple" ? ThinkingLevel.LOW : ThinkingLevel.LOW,
-      },
-    };
-  }
-  return { systemInstruction };
 }
 
 export function classifyGeminiError(error: unknown): {
@@ -324,11 +203,10 @@ async function discoverActiveTextModels(ai: GoogleGenAI): Promise<string[]> {
     discovered.sort((a, b) => {
       const score = (name: string) => {
         const n = name.toLowerCase();
-        if (n.includes("3.5-flash-lite") || n.includes("3.1-flash-lite")) return 0;
+        if (n.includes("hydrogen")) return 0;
         if (n.includes("flash-lite")) return 1;
-        if (n.includes("3.8-flash") || n.includes("hydrogen")) return 2;
-        if (n.includes("flash")) return 3;
-        return 4;
+        if (n.includes("flash")) return 2;
+        return 3;
       };
       return score(a) - score(b);
     });
@@ -339,127 +217,64 @@ async function discoverActiveTextModels(ai: GoogleGenAI): Promise<string[]> {
   }
 }
 
-function getCandidateList(tier: QueryComplexity): string[] {
-  const configuredModel = process.env.GEMINI_MODEL?.trim();
-  const baseModels =
-    tier === "simple" ? SIMPLE_TIER_MODELS : COMPLEX_TIER_MODELS;
+export async function generateNursingReply(
+  ai: GoogleGenAI,
+  question: string,
+  safeHistory: AssistantHistoryItem[]
+): Promise<{ reply: string; modelUsed: string }> {
+  const contents = [
+    ...safeHistory.map((msg) => ({
+      role: msg.role === "assistant" ? "model" : "user",
+      parts: [{ text: msg.content }],
+    })),
+    {
+      role: "user",
+      parts: [{ text: question }],
+    },
+  ];
 
-  return Array.from(
+  const configuredModel = process.env.GEMINI_MODEL?.trim();
+  const initialCandidates = Array.from(
     new Set(
-      [configuredModel, cachedModelByTier[tier], ...baseModels].filter(
+      [configuredModel, cachedDiscoveredModel, ...DEFAULT_TEXT_MODELS].filter(
         (m): m is string => Boolean(m)
       )
     )
   );
-}
 
-export function roundMs(ms: number): number {
-  return Math.round(ms * 100) / 100;
-}
-
-export async function streamNursingReply(options: {
-  ai: GoogleGenAI;
-  question: string;
-  safeHistory: AssistantHistoryItem[];
-  tReqStart: number;
-  tPrepDone: number;
-  signal?: AbortSignal;
-  onMeta?: (meta: { tier: QueryComplexity; model: string }) => void;
-  onChunk: (text: string) => void;
-}): Promise<{ reply: string; metrics: GenerationMetrics }> {
-  const { ai, question, safeHistory, tReqStart, tPrepDone, signal, onMeta, onChunk } =
-    options;
-
-  const tier = classifyNursingQuery(question);
-  const { contents, systemInstruction, historyTurnsUsed } =
-    buildOptimizedPromptPayload(question, safeHistory, tier);
-  const tPromptDone = performance.now();
-
-  const initialCandidates = getCandidateList(tier);
-
-  const tryStreamModels = async (models: string[]) => {
+  const tryModels = async (models: string[]) => {
     let lastError: unknown;
     for (const model of models) {
-      if (signal?.aborted) {
-        throw new Error("CLIENT_ABORTED");
-      }
-
-      const tDispatch = performance.now();
-      let tFirstChunk: number | null = null;
-      let fullReply = "";
-      let promptTokens: number | undefined;
-      let outputTokens: number | undefined;
-      let totalTokens: number | undefined;
-
       try {
-        const stream = await ai.models.generateContentStream({
+        const supportsThinkingLevel =
+          model === "gemini-4-hydrogen" || model.startsWith("gemini-3.");
+        const response = await ai.models.generateContent({
           model,
           contents,
-          config: getModelConfig(model, tier, systemInstruction),
+          config: supportsThinkingLevel
+            ? {
+                systemInstruction: SYSTEM_INSTRUCTION,
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+              }
+            : {
+                systemInstruction: SYSTEM_INSTRUCTION,
+              },
         });
-
-        onMeta?.({ tier, model });
-
-        for await (const chunk of stream) {
-          if (signal?.aborted) {
-            break;
-          }
-
-          if (chunk.usageMetadata) {
-            promptTokens = chunk.usageMetadata.promptTokenCount;
-            outputTokens = chunk.usageMetadata.candidatesTokenCount;
-            totalTokens = chunk.usageMetadata.totalTokenCount;
-          }
-
-          const delta = chunk.text;
-          if (delta) {
-            if (tFirstChunk === null) {
-              tFirstChunk = performance.now();
-            }
-            fullReply += delta;
-            onChunk(delta);
-          }
-        }
-
-        const tGenDone = performance.now();
-        cachedModelByTier[tier] = model;
-
-        const metrics: GenerationMetrics = {
-          tier,
-          modelUsed: model,
-          backendPrepMs: roundMs(tPrepDone - tReqStart),
-          promptPrepMs: roundMs(tPromptDone - tPrepDone),
-          sdkDispatchMs: roundMs(tDispatch - tPromptDone),
-          ttftMs: roundMs((tFirstChunk ?? tGenDone) - tDispatch),
-          genDurationMs: roundMs(tGenDone - tDispatch),
-          totalMs: roundMs(tGenDone - tReqStart),
-          promptTokens,
-          outputTokens,
-          totalTokens,
-          inputChars: question.length,
-          outputChars: fullReply.length,
-          historyTurnsUsed,
-        };
-
-        return { reply: fullReply.trim(), metrics };
+        cachedDiscoveredModel = model;
+        return { reply: response.text?.trim() ?? "", modelUsed: model };
       } catch (error) {
         lastError = error;
-        // If we already emitted partial chunks to the client, do not retry another model mid-stream
-        if (tFirstChunk !== null) {
-          throw error;
-        }
         const info = classifyGeminiError(error);
         if (!info.isModelNotFound) {
           throw error;
         }
       }
     }
-
     throw lastError ?? new Error("No available Gemini model succeeded.");
   };
 
   try {
-    return await tryStreamModels(initialCandidates);
+    return await tryModels(initialCandidates);
   } catch (error) {
     const info = classifyGeminiError(error);
     if (!info.isModelNotFound) {
@@ -473,33 +288,8 @@ export async function streamNursingReply(options: {
       throw error;
     }
 
-    return await tryStreamModels(discovered);
+    return await tryModels(discovered);
   }
-}
-
-export async function generateNursingReply(
-  ai: GoogleGenAI,
-  question: string,
-  safeHistory: AssistantHistoryItem[],
-  tReqStart = performance.now(),
-  tPrepDone = performance.now()
-): Promise<{ reply: string; modelUsed: string; metrics: GenerationMetrics }> {
-  let replyText = "";
-  const { reply, metrics } = await streamNursingReply({
-    ai,
-    question,
-    safeHistory,
-    tReqStart,
-    tPrepDone,
-    onChunk: (delta) => {
-      replyText += delta;
-    },
-  });
-  return {
-    reply: reply || replyText.trim(),
-    modelUsed: metrics.modelUsed,
-    metrics,
-  };
 }
 
 export function ensurePlayableWav(

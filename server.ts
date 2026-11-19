@@ -2,17 +2,15 @@ import "dotenv/config";
 import express from "express";
 import fs from "fs";
 import path from "path";
-import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
 import {
   ALLOWED_TTS_VOICES,
   classifyGeminiError,
   ensurePlayableWav,
+  generateNursingReply,
   getGeminiClient,
   isGeminiConfigured,
-  roundMs,
-  streamNursingReply,
   type AssistantHistoryItem,
 } from "./api/_gemini.js";
 
@@ -131,8 +129,6 @@ async function startServer() {
   });
 
   app.post("/api/assistant", async (req, res) => {
-    const tReqStart = performance.now();
-
     const ai = getGeminiClient();
     if (!ai) {
       res.status(503).json({
@@ -143,12 +139,7 @@ async function startServer() {
       return;
     }
 
-    const body = req.body as {
-      question?: unknown;
-      history?: unknown;
-      stream?: unknown;
-    };
-
+    const body = req.body as { question?: unknown; history?: unknown };
     const question =
       typeof body?.question === "string" ? body.question.trim() : "";
 
@@ -179,136 +170,16 @@ async function startServer() {
           typeof item.content === "string" &&
           item.content.trim().length > 0
       )
-      .slice(-4);
-
-    const wantsStream =
-      body?.stream === true ||
-      String(req.headers?.accept ?? "").includes("text/event-stream");
-
-    const tPrepDone = performance.now();
-    const abortController = new AbortController();
-    res.on("close", () => {
-      if (!res.writableEnded) {
-        abortController.abort();
-      }
-    });
-
-    if (wantsStream) {
-      res.status(200);
-      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-      res.setHeader("Cache-Control", "no-cache, no-transform");
-      res.setHeader("Connection", "keep-alive");
-      res.setHeader("X-Accel-Buffering", "no");
-      res.flushHeaders?.();
-
-      let sentMeta = false;
-      try {
-        const { reply, metrics } = await streamNursingReply({
-          ai,
-          question,
-          safeHistory,
-          tReqStart,
-          tPrepDone,
-          signal: abortController.signal,
-          onMeta: (meta) => {
-            if (!sentMeta && !abortController.signal.aborted) {
-              sentMeta = true;
-              res.write(`data: ${JSON.stringify({ type: "meta", ...meta })}\n\n`);
-            }
-          },
-          onChunk: (text) => {
-            if (!abortController.signal.aborted) {
-              res.write(`data: ${JSON.stringify({ type: "delta", text })}\n\n`);
-            }
-          },
-        });
-
-        if (!reply && !abortController.signal.aborted) {
-          res.write(
-            `data: ${JSON.stringify({
-              type: "error",
-              code: "EMPTY_MODEL_RESPONSE",
-              message:
-                "El servicio de inteligencia artificial no devolvió contenido. Intenta reformular tu consulta.",
-            })}\n\n`
-          );
-          res.end();
-          return;
-        }
-
-        const finalTotalMs = roundMs(performance.now() - tReqStart);
-        console.info(
-          "[assistant:perf]",
-          JSON.stringify({
-            runtime: "localhost",
-            stream: true,
-            ...metrics,
-            totalMs: finalTotalMs,
-          })
-        );
-
-        if (!abortController.signal.aborted) {
-          res.write(
-            `data: ${JSON.stringify({
-              type: "done",
-              model: metrics.modelUsed,
-              tier: metrics.tier,
-              metrics: { ...metrics, totalMs: finalTotalMs },
-            })}\n\n`
-          );
-        }
-        res.end();
-      } catch (error) {
-        if (abortController.signal.aborted) {
-          res.end();
-          return;
-        }
-        const info = classifyGeminiError(error);
-        console.error("[assistant:error]", {
-          runtime: "localhost",
-          status: info.status,
-          isAuthError: info.isAuthError,
-          isRateLimit: info.isRateLimit,
-          isModelNotFound: info.isModelNotFound,
-          elapsedMs: roundMs(performance.now() - tReqStart),
-        });
-        const code = info.isAuthError
-          ? "AI_AUTH_ERROR"
-          : info.isRateLimit
-          ? "AI_RATE_LIMIT"
-          : info.isModelNotFound
-          ? "AI_MODEL_NOT_FOUND"
-          : "AI_UPSTREAM_ERROR";
-        const message = info.isAuthError
-          ? "La API de inteligencia artificial no está autorizada o la clave configurada no es válida en este entorno."
-          : info.isRateLimit
-          ? "Se alcanzó temporalmente el límite de consultas del servicio de IA. Espera unos segundos e inténtalo de nuevo."
-          : info.isModelNotFound
-          ? "Ningún modelo de Gemini compatible estuvo disponible para tu clave API (error 404)."
-          : "Ocurrió un error al consultar el servicio de inteligencia artificial. Por favor intenta nuevamente.";
-
-        res.write(`data: ${JSON.stringify({ type: "error", code, message })}\n\n`);
-        res.end();
-      }
-      return;
-    }
+      .slice(-6);
 
     try {
-      let bufferedReply = "";
-      const { reply, metrics } = await streamNursingReply({
+      const { reply, modelUsed } = await generateNursingReply(
         ai,
         question,
-        safeHistory,
-        tReqStart,
-        tPrepDone,
-        signal: abortController.signal,
-        onChunk: (delta) => {
-          bufferedReply += delta;
-        },
-      });
+        safeHistory
+      );
 
-      const finalReply = reply || bufferedReply.trim();
-      if (!finalReply) {
+      if (!reply) {
         res.status(502).json({
           error: "EMPTY_MODEL_RESPONSE",
           message:
@@ -317,33 +188,10 @@ async function startServer() {
         return;
       }
 
-      const finalTotalMs = roundMs(performance.now() - tReqStart);
-      console.info(
-        "[assistant:perf]",
-        JSON.stringify({
-          runtime: "localhost",
-          stream: false,
-          ...metrics,
-          totalMs: finalTotalMs,
-        })
-      );
-
-      res.json({
-        reply: finalReply,
-        model: metrics.modelUsed,
-        tier: metrics.tier,
-        metrics: { ...metrics, totalMs: finalTotalMs },
-      });
+      res.json({ reply, model: modelUsed });
     } catch (error) {
+      console.error("Gemini API error:", error);
       const info = classifyGeminiError(error);
-      console.error("[assistant:error]", {
-        runtime: "localhost",
-        status: info.status,
-        isAuthError: info.isAuthError,
-        isRateLimit: info.isRateLimit,
-        isModelNotFound: info.isModelNotFound,
-        elapsedMs: roundMs(performance.now() - tReqStart),
-      });
 
       if (info.isAuthError) {
         res.status(401).json({
